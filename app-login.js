@@ -1,0 +1,660 @@
+/* build: v1.42.0 — inclui rota "parceiro-indicadores" (força recompilação das Functions)
+   ============================================================
+   Cloudflare Pages Function — roteador único para /api/*
+   Executa as funções do backend (server/*.js, no formato clássico
+   exports.handler = async (event) => ({ statusCode, headers, body }))
+   dentro do runtime do Cloudflare (Workers + nodejs_compat).
+
+   O front chama /api/<nome> direto, que casa com esta rota ([[path]]).
+
+   Armazenamento: Supabase (via fetch) — configure SUPABASE_URL e
+   SUPABASE_SERVICE_KEY nas variáveis do projeto Pages.
+   ============================================================ */
+
+// Import estático de cada handler (o bundler precisa vê-los em build).
+import * as fAlertas from '../../server/alertas.js';
+import * as fAppLogin from '../../server/app-login.js';
+import * as fAprovacoes from '../../server/aprovacoes.js';
+import * as fAuditoria from '../../server/auditoria.js';
+import * as fAuth from '../../server/auth.js';
+import * as fBiblioteca from '../../server/biblioteca.js';
+import * as fCampanhas from '../../server/campanhas.js';
+import * as fClima from '../../server/clima.js';
+import * as fDemandas from '../../server/demandas.js';
+import * as fEventos from '../../server/eventos.js';
+import * as fIaGroq from '../../server/ia-groq.js';
+import * as fLeads from '../../server/leads.js';
+import * as fLimparTeste from '../../server/limpar-teste.js';
+import * as fMercado from '../../server/mercado.js';
+import * as fMonitoramento from '../../server/monitoramento.js';
+import * as fNotificacoes from '../../server/notificacoes.js';
+import * as fOrcamentos from '../../server/orcamentos.js';
+import * as fParceiros from '../../server/parceiros.js';
+import * as fProdutos from '../../server/produtos.js';
+import * as fRanking from '../../server/ranking.js';
+import * as fResultados from '../../server/resultados.js';
+import * as fSenha from '../../server/senha.js';
+import * as fTenants from '../../server/tenants.js';
+import * as fVendas from '../../server/vendas.js';
+import * as fVendedores from '../../server/vendedores.js';
+
+/* ------------------------------------------------------------------
+   Handlers embutidos: canais, integracao e localizacoes.
+   Ficam AQUI (e não em server/*.js) porque o upload web do GitHub não
+   adiciona arquivos NOVOS em subpasta de forma confiável. Este roteador
+   é um arquivo já existente — atualizá-lo sempre funciona no deploy.
+   Dependem apenas de server/_lib/* (que já estão no repositório).
+   ------------------------------------------------------------------ */
+import * as _store from '../../server/_lib/store.js';
+import * as _auth from '../../server/_lib/auth.js';
+const _storeM = _store.default || _store;
+const _authM = _auth.default || _auth;
+const { ok, fail, audit, clientIp, tenantStore, pageOpts } = _storeM;
+const { fromEvent, tenantFromEvent, requireAuth } = _authM;
+import * as _nodeCrypto from 'node:crypto';
+const _crypto = _nodeCrypto.default || _nodeCrypto;
+function _authSecret(){ return process.env.AUTH_SECRET || 'sbs-dev-secret-troque-em-producao'; }
+function _hashSenha(s){ return _crypto.createHash('sha256').update(String(s) + _authSecret()).digest('hex'); }
+const _PERFIS = ['marketing','gerente','ceo','mercado','ti','admin'];
+async function _enviarBoasVindas(email, nome, perfil){
+  const key = process.env.RESEND_API_KEY;
+  if (!key) return false;
+  const from = process.env.RESEND_FROM || process.env.MAIL_FROM || 'Plataforma Terra Pulse <nao-responda@terrapulse.com.br>';
+  const replyTo = process.env.RESEND_REPLY_TO || 'suporte@terrapulse.com.br';
+  const url = process.env.APP_URL || '/painel-ifarm.html';
+  const rotulo = {marketing:'Marketing',gerente:'Gerente Nacional',ceo:'CEO',mercado:'Inteligência de Mercado',ti:'Tecnologia (TI)',admin:'Admin master'}[perfil]||perfil;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method:'POST',
+      headers:{ 'Authorization':'Bearer '+key, 'Content-Type':'application/json' },
+      body: JSON.stringify({ from, to:[email], reply_to: replyTo,
+        subject: 'Seu acesso à Plataforma Terra Pulse foi criado',
+        text: 'Olá '+(nome||'')+',\n\nSeu acesso à Plataforma Terra Pulse foi criado com o perfil '+rotulo+'.\n\nEndereço: '+url+'\nUsuário: '+email+'\nSenha inicial: 12345678 (você deve trocá-la no primeiro acesso)\n\nNo primeiro login será pedido para ativar a verificação em 2 passos (app autenticador).\n\nSe não reconhece este e-mail, ignore.' })
+    });
+    return r.ok;
+  } catch (e) { return false; }
+}
+const _PADRAO_USERS = [
+  { email:'franz@terrapulse.com.br', perfil:'marketing', nome:'Franz' },
+  { email:'medina@terrapulse.com.br', perfil:'gerente', nome:'Medina' },
+  { email:'tiago.mascheto@terrapulse.com.br', perfil:'ceo', nome:'Tiago Mascheto' },
+  { email:'victor.hugo@terrapulse.com.br', perfil:'mercado', nome:'Victor Hugo' },
+  { email:'ti@terrapulse.com.br', perfil:'ti', nome:'TI' },
+  { email:'admin@terrapulse.com.br', perfil:'admin', nome:'Admin master' }
+];
+async function _semearUsuarios(db){
+  let base = _PADRAO_USERS;
+  try { const raw = process.env.USERS_JSON; if (raw){ const j = JSON.parse(raw); if (Array.isArray(j) && j.length) base = j; } } catch(e){}
+  const criados = [];
+  for (const p of base){
+    const email = (p.email||'').trim().toLowerCase(); if(!email) continue;
+    const ex = await db.get('usuarios', email);
+    if (!ex){ criados.push(await db.put('usuarios', { id:email, email, nome:p.nome||email, perfil:p.perfil||'marketing', tenant:'sbs', hash:_hashSenha(p.senha||'12345678'), precisaTrocar:true, criadoEm:new Date().toISOString() })); }
+  }
+  return criados;
+}
+
+/* Gestão de usuários/acessos (Marketing + Admin). Coleção `usuarios`.
+   Mesma fórmula de hash do server/auth.js para que o login funcione.
+   GET lista (sem hash) · POST cria · PATCH edita/reseta senha · DELETE remove. */
+async function hUsuarios(event){
+  try {
+    const r = requireAuth(event, ['marketing','admin']);
+    if (r.erro) return fail(r.erro, r.code);
+    const u = r.user;
+    const db = tenantStore(tenantFromEvent(event));
+    const strip = x => { if(!x) return x; const o = Object.assign({}, x); delete o.hash; return o; };
+    if (event.httpMethod === 'GET') {
+      const q = event.queryStringParameters || {};
+      let rows = await db.list('usuarios', {}, pageOpts(Object.assign({ limite: 200 }, q)));
+      if (!rows || !rows.length){ await _semearUsuarios(db); rows = await db.list('usuarios', {}, pageOpts(Object.assign({ limite: 200 }, q))); }
+      return ok(rows.map(strip));
+    }
+    if (event.httpMethod === 'POST') {
+      const b = JSON.parse(event.body || '{}');
+      const email = (b.email || '').trim().toLowerCase();
+      const nome = (b.nome || '').trim();
+      const perfil = (b.perfil || '').trim();
+      if (!email || !email.includes('@')) return fail('Informe um e-mail válido');
+      if (!nome) return fail('Informe o nome');
+      if (!_PERFIS.includes(perfil)) return fail('Perfil inválido');
+      const existe = await db.get('usuarios', email);
+      if (existe) return fail('Já existe um usuário com este e-mail', 409);
+      const senhaInicial = (b.senha && String(b.senha)) || '12345678';
+      const ent = { id: email, email, nome, perfil, tenant: 'sbs', hash: _hashSenha(senhaInicial), precisaTrocar: true, criadoEm: new Date().toISOString(), criadoPor: u.sub || 'sistema' };
+      const saved = await db.put('usuarios', ent);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'criou', entidade:'usuarios', entidadeId:email, ip:clientIp(event) });
+      const emailEnviado = await _enviarBoasVindas(email, nome, perfil);
+      return ok(Object.assign(strip(saved), { emailEnviado }));
+    }
+    if (event.httpMethod === 'PATCH') {
+      const b = JSON.parse(event.body || '{}');
+      const email = (b.id || b.email || '').trim().toLowerCase();
+      if (!email) return fail('id obrigatório');
+      const cur = await db.get('usuarios', email);
+      if (!cur) return fail('Usuário não encontrado', 404);
+      if (b.acao === 'reset') {
+        cur.hash = _hashSenha('12345678'); cur.precisaTrocar = true;
+        await db.put('usuarios', cur);
+        await audit({ usuario:u.sub, perfil:u.perfil, acao:'redefiniu-senha', entidade:'usuarios', entidadeId:email, ip:clientIp(event) });
+        return ok({ id: email, reset: true });
+      }
+      if (b.acao === 'reset-2fa') {
+        cur.twofaOn = false; delete cur.twofaSeg; delete cur.twofaRec;
+        await db.put('usuarios', cur);
+        await audit({ usuario:u.sub, perfil:u.perfil, acao:'resetou-2fa', entidade:'usuarios', entidadeId:email, ip:clientIp(event) });
+        return ok({ id: email, reset2fa: true });
+      }
+      if (b.nome != null && String(b.nome).trim()) cur.nome = String(b.nome).trim();
+      if (b.perfil != null) { if (!_PERFIS.includes(b.perfil)) return fail('Perfil inválido'); cur.perfil = b.perfil; }
+      await db.put('usuarios', cur);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'editou', entidade:'usuarios', entidadeId:email, ip:clientIp(event) });
+      return ok(strip(cur));
+    }
+    if (event.httpMethod === 'DELETE') {
+      const q = event.queryStringParameters || {};
+      const email = (q.id || q.email || '').trim().toLowerCase();
+      if (!email) return fail('id obrigatório');
+      if (email === (u.sub || '').toLowerCase()) return fail('Você não pode remover o seu próprio acesso');
+      const cur = await db.get('usuarios', email);
+      if (cur && cur.perfil === 'admin') {
+        const all = await db.list('usuarios', {}, { limit: 500 });
+        if (all.filter(x => x.perfil === 'admin').length <= 1) return fail('Não é possível remover o último administrador');
+      }
+      await db.remove('usuarios', email);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'removeu', entidade:'usuarios', entidadeId:email, ip:clientIp(event) });
+      return ok({ removido: email });
+    }
+    return fail('Método não suportado', 405);
+  } catch (e) { return fail(e.message, 500); }
+}
+
+async function hCanais(event){
+  try {
+    const db = tenantStore(tenantFromEvent(event));
+    const u = fromEvent(event) || {};
+    if (event.httpMethod === 'GET') {
+      const q = event.queryStringParameters || {};
+      return ok(await db.list('canais', {}, pageOpts(q)));
+    }
+    if (event.httpMethod === 'POST') {
+      const b = JSON.parse(event.body || '{}');
+      if (!b.id) return fail('id obrigatório');
+      const now = new Date().toISOString();
+      const ent = Object.assign({}, b, { atualizadoEm: now, atualizadoPor: u.sub || 'sistema' });
+      const saved = await db.put('canais', ent);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao: b.tipo === 'handle' ? 'editou' : 'criou', entidade:'canais', entidadeId:b.id, ip:clientIp(event) });
+      return ok(saved);
+    }
+    if (event.httpMethod === 'DELETE') {
+      const q = event.queryStringParameters || {};
+      if (!q.id) return fail('id obrigatório');
+      await db.remove('canais', q.id);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'removeu', entidade:'canais', entidadeId:q.id, ip:clientIp(event) });
+      return ok({ removido: q.id });
+    }
+    return fail('Método não suportado', 405);
+  } catch (e) { return fail(e.message, 500); }
+}
+
+async function hCashback(event){
+  try {
+    const db = tenantStore(tenantFromEvent(event));
+    const u = fromEvent(event) || {};
+    if (event.httpMethod === 'GET') {
+      const q = event.queryStringParameters || {};
+      return ok(await db.list('cashback', {}, pageOpts(q)));
+    }
+    if (event.httpMethod === 'POST') {
+      const b = JSON.parse(event.body || '{}');
+      if (!b.id) b.id = Date.now();
+      const now = new Date().toISOString();
+      const ent = Object.assign({ criadoEm: now }, b, { atualizadoEm: now, atualizadoPor: u.sub || 'sistema' });
+      const saved = await db.put('cashback', ent);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao: b.kind === 'lead' ? 'lead_cashback' : 'registro_cashback', entidade:'cashback', entidadeId:String(b.id), ip:clientIp(event) });
+      return ok(saved);
+    }
+    if (event.httpMethod === 'PATCH') {
+      const b = JSON.parse(event.body || '{}');
+      if (!b.id) return fail('id obrigatório');
+      const cur = await db.get('cashback', b.id);
+      if (!cur) return fail('Registro não encontrado', 404);
+      const saved = await db.put('cashback', Object.assign({}, cur, b, { atualizadoEm: new Date().toISOString() }));
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'editou', entidade:'cashback', entidadeId:String(b.id), ip:clientIp(event) });
+      return ok(saved);
+    }
+    if (event.httpMethod === 'DELETE') {
+      const q = event.queryStringParameters || {};
+      const id = q.id || (JSON.parse(event.body || '{}').id);
+      if (!id) return fail('id obrigatório');
+      await db.remove('cashback', id);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'removeu', entidade:'cashback', entidadeId:String(id), ip:clientIp(event) });
+      return ok({ removido: id });
+    }
+    return fail('Método não suportado', 405);
+  } catch (e) { return fail(e.message, 500); }
+}
+
+async function hLixeira(event){
+  try {
+    const db = tenantStore(tenantFromEvent(event));
+    const u = fromEvent(event) || {};
+    if (event.httpMethod === 'GET') {
+      const q = event.queryStringParameters || {};
+      return ok(await db.list('lixeira', {}, pageOpts(q)));
+    }
+    if (event.httpMethod === 'POST') {
+      const b = JSON.parse(event.body || '{}');
+      if (!b.id) b.id = Date.now();
+      const now = new Date().toISOString();
+      const ent = Object.assign({ tipo:'item', origem:'', item:{} }, b, { excluidoEm: b.excluidoEm || now, excluidoPor: b.excluidoPor || u.sub || 'sistema' });
+      const saved = await db.put('lixeira', ent);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'moveu_lixeira', entidade:ent.origem||'lixeira', entidadeId:String(b.refId||b.id), ip:clientIp(event) });
+      return ok(saved);
+    }
+    if (event.httpMethod === 'DELETE') {
+      const q = event.queryStringParameters || {};
+      const id = q.id || (JSON.parse(event.body || '{}').id);
+      if (!id) return fail('id obrigatório');
+      await db.remove('lixeira', id);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'excluiu_definitivo', entidade:'lixeira', entidadeId:String(id), ip:clientIp(event) });
+      return ok({ removido: id });
+    }
+    return fail('Método não suportado', 405);
+  } catch (e) { return fail(e.message, 500); }
+}
+
+async function hIntegracao(event){
+  try {
+    const db = tenantStore(tenantFromEvent(event));
+    const u = fromEvent(event) || {};
+    if (event.httpMethod === 'GET') {
+      const q = event.queryStringParameters || {};
+      const filtros = {};
+      if (q.de)   filtros.sistema = q.de;
+      if (q.tipo) filtros.tipo = q.tipo;
+      return ok(await db.list('integracao', filtros, pageOpts(q)));
+    }
+    if (event.httpMethod === 'POST') {
+      const b = JSON.parse(event.body || '{}');
+      if (!b.tipo) return fail('Informe o tipo do dado (vendas, vendedores, …)');
+      const now = new Date().toISOString();
+      const ent = {
+        sistema: b.sistema || 'painel-sbs',
+        tipo: String(b.tipo),
+        ref: b.ref || '',
+        titulo: b.titulo || '',
+        resumo: b.resumo || '',
+        payload: b.payload || {},
+        criadoEm: now,
+        criadoPor: b.criadoPor || u.sub || 'sistema'
+      };
+      const saved = await db.put('integracao', ent);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'enviou-integracao', entidade:'integracao', entidadeId:saved.id, ip:clientIp(event) });
+      return ok(saved);
+    }
+    if (event.httpMethod === 'DELETE') {
+      const q = event.queryStringParameters || {};
+      if (!q.id) return fail('id obrigatório');
+      await db.remove('integracao', q.id);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'removeu', entidade:'integracao', entidadeId:q.id, ip:clientIp(event) });
+      return ok({ removido: q.id });
+    }
+    return fail('Método não suportado', 405);
+  } catch (e) { return fail(e.message, 500); }
+}
+
+/* Exportação de CRM por empresa (tenant). Cada empresa baixa TODOS os seus dados.
+   GET /api/exportar                          -> JSON bundle (todas as coleções do tenant)
+   GET /api/exportar?colecao=leads            -> JSON de 1 coleção
+   GET /api/exportar?colecao=leads&formato=csv-> CSV de 1 coleção (Excel)
+   Super-admin pode escolher a empresa com ?tenant=slug. */
+const _EXP_COLECOES = ['leads','vendas','orcamentos','vendedores','campanhas','produtos','notificacoes','monitoramentos','aprovacoes','aprovacoes_hist','eventos','parceiros','biblioteca','demandas','canais','alertas','cashback','mi_cotacoes','mi_concorrentes','mi_cc_movimentos','mi_regioes','mi_tendencias'];
+const _EXP_COLECOES_ADMIN = ['usuarios','auditoria','tenants'];
+function _expIsSuper(u){ const t = (u && u.tenant) ? String(u.tenant) : 'sbs'; return t === 'sbs' || (u && u.perfil === 'admin'); }
+function _expLimpaUsuario(r){ if (r && (r.hash || r.reset)) { const c = Object.assign({}, r); delete c.hash; delete c.reset; delete c.twofaSeg; delete c.twofaRec; return c; } return r; }
+function _expCSV(rows){
+  if (!rows || !rows.length) return '';
+  const cols = Array.from(rows.reduce((s,r)=>{ Object.keys(r||{}).forEach(k=>s.add(k)); return s; }, new Set()));
+  const esc = v => { if (v==null) return ''; const s = (typeof v==='object') ? JSON.stringify(v) : String(v); return /[",\n;]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; };
+  const out = [cols.join(',')];
+  for (const r of rows) out.push(cols.map(c => esc(r ? r[c] : '')).join(','));
+  return out.join('\r\n');
+}
+async function hExportar(event){
+  const H = { 'content-type':'application/json; charset=utf-8' };
+  try {
+    if (event.httpMethod !== 'GET') return { statusCode:405, headers:H, body: JSON.stringify({ ok:false, erro:'Método não suportado' }) };
+    const auth = requireAuth(event);
+    if (auth.erro) return { statusCode: auth.code||401, headers:H, body: JSON.stringify({ ok:false, erro:auth.erro }) };
+    const user = auth.user;
+    const q = event.queryStringParameters || {};
+    let tenant = tenantFromEvent(event);
+    if (q.tenant && _expIsSuper(user)) tenant = q.tenant;
+    const db = tenantStore(tenant);
+    const permitidas = _expIsSuper(user) ? _EXP_COLECOES.concat(_EXP_COLECOES_ADMIN) : _EXP_COLECOES;
+
+    if (q.colecao) {
+      if (!permitidas.includes(q.colecao)) return { statusCode:403, headers:H, body: JSON.stringify({ ok:false, erro:'Coleção indisponível para exportação' }) };
+      let rows = await db.list(q.colecao, {}, { limit: 100000 });
+      if (q.colecao === 'usuarios') rows = rows.map(_expLimpaUsuario);
+      await audit({ usuario:user.sub, perfil:user.perfil, acao:'exportou', entidade:q.colecao, ip:clientIp(event) });
+      if ((q.formato||'').toLowerCase() === 'csv') {
+        return { statusCode:200, headers:{ 'content-type':'text/csv; charset=utf-8', 'content-disposition':'attachment; filename="'+tenant+'-'+q.colecao+'.csv"' }, body: '\uFEFF' + _expCSV(rows) };
+      }
+      return { statusCode:200, headers:H, body: JSON.stringify({ ok:true, tenant, colecao:q.colecao, total:rows.length, dados:rows }) };
+    }
+
+    const colecoes = {};
+    for (const c of permitidas) {
+      try { let rows = await db.list(c, {}, { limit: 100000 }); if (c==='usuarios') rows = rows.map(_expLimpaUsuario); colecoes[c] = rows; }
+      catch (e) { colecoes[c] = []; }
+    }
+    const totais = {}; Object.keys(colecoes).forEach(k => totais[k] = colecoes[k].length);
+    await audit({ usuario:user.sub, perfil:user.perfil, acao:'exportou-tudo', entidade:'crm', ip:clientIp(event) });
+    return { statusCode:200, headers:{ 'content-type':'application/json; charset=utf-8', 'content-disposition':'attachment; filename="'+tenant+'-crm-export.json"' }, body: JSON.stringify({ ok:true, produto:'iFarm CRM', tenant, exportadoEm:new Date().toISOString(), totais, colecoes }, null, 2) };
+  } catch (e) { return { statusCode:500, headers:H, body: JSON.stringify({ ok:false, erro:'Falha ao exportar: ' + (e && e.message || e) }) }; }
+}
+
+/* Chamados / suporte (abertura de tickets pelos clientes).
+   GET    /api/chamados                 -> lista (cliente vê os seus; super vê todos)
+   POST   /api/chamados {assunto,mensagem,prioridade}         -> abre chamado
+   PATCH  /api/chamados {id,status?,resposta?}                -> responde/muda status
+   DELETE /api/chamados?id=...          -> remove (super) */
+async function hChamados(event){
+  const H = { 'content-type':'application/json' };
+  try {
+    const auth = requireAuth(event);
+    if (auth.erro) return { statusCode: auth.code||401, headers:H, body: JSON.stringify({ ok:false, erro:auth.erro }) };
+    const u = auth.user;
+    const isSuper = (String(u.tenant||'sbs')==='sbs') || (u.perfil==='admin') || (u.perfil==='ti');
+    const db = tenantStore(tenantFromEvent(event));
+    if (event.httpMethod === 'GET') {
+      const q = event.queryStringParameters || {};
+      let rows = await db.list('chamados', {}, pageOpts(Object.assign({ limite:500 }, q)));
+      rows = rows.sort((a,b)=>(b.ts||0)-(a.ts||0));
+      if (q.status) rows = rows.filter(r=>r.status===q.status);
+      return ok(rows);
+    }
+    if (event.httpMethod === 'POST') {
+      const b = JSON.parse(event.body||'{}');
+      if (!b.assunto) return fail('Informe o assunto do chamado');
+      const now = new Date().toISOString();
+      const ent = {
+        id: b.id || ('ch_'+Date.now()+'_'+Math.random().toString(36).slice(2,6)),
+        assunto: String(b.assunto).slice(0,140),
+        mensagem: String(b.mensagem||'').slice(0,4000),
+        prioridade: ['baixa','media','alta'].includes(b.prioridade) ? b.prioridade : 'media',
+        categoria: b.categoria || 'geral',
+        status: 'aberto',
+        autor: u.sub || 'cliente', autorNome: u.nome || u.sub || '',
+        respostas: [], ts: Date.now(), criadoEm: now, atualizadoEm: now
+      };
+      const saved = await db.put('chamados', ent);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'abriu-chamado', entidade:'chamados', entidadeId:ent.id, ip:clientIp(event) });
+      return ok(saved);
+    }
+    if (event.httpMethod === 'PATCH') {
+      const b = JSON.parse(event.body||'{}');
+      if (!b.id) return fail('id obrigatório');
+      const cur = await db.get('chamados', b.id);
+      if (!cur) return fail('Chamado não encontrado', 404);
+      if (b.resposta) {
+        cur.respostas = (cur.respostas||[]).concat([{ por: u.sub||'', nome: u.nome||'', equipe: isSuper, texto: String(b.resposta).slice(0,4000), em: new Date().toISOString() }]);
+        if (isSuper && cur.status==='aberto') cur.status = 'andamento';
+      }
+      if (b.status && ['aberto','andamento','resolvido'].includes(b.status)) cur.status = b.status;
+      cur.atualizadoEm = new Date().toISOString();
+      const saved = await db.put('chamados', cur);
+      await audit({ usuario:u.sub, perfil:u.perfil, acao:'atualizou-chamado', entidade:'chamados', entidadeId:cur.id, ip:clientIp(event) });
+      return ok(saved);
+    }
+    if (event.httpMethod === 'DELETE') {
+      if (!isSuper) return fail('Sem permissão', 403);
+      const q = event.queryStringParameters || {};
+      if (!q.id) return fail('id obrigatório');
+      await db.remove('chamados', q.id);
+      return ok({ removido:q.id });
+    }
+    return fail('Método não suportado', 405);
+  } catch (e) { return { statusCode:500, headers:H, body: JSON.stringify({ ok:false, erro:e.message }) }; }
+}
+
+async function hStorage(event){
+  const H = { 'content-type': 'application/json' };
+  const SB = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+  const KEY = process.env.SUPABASE_SERVICE_KEY || '';
+  const BUCKET = 'materiais';
+  if (event.httpMethod !== 'POST') return { statusCode:405, headers:H, body: JSON.stringify({ ok:false, erro:'Método não suportado' }) };
+  // Sem Supabase configurado: devolve não-configurado (o front cai no base64/demonstração).
+  if (!SB || !KEY) return { statusCode:200, headers:H, body: JSON.stringify({ ok:true, data:{ configurado:false } }) };
+  try {
+    const b = JSON.parse(event.body || '{}');
+    let dataUrl = b.dataUrl || '';
+    const nome = (b.nome || ('arquivo-' + Date.now())).replace(/[^a-zA-Z0-9._-]/g, '_');
+    let mime = b.tipo || 'application/octet-stream';
+    let b64 = dataUrl;
+    const m = /^data:([^;]+);base64,(.*)$/.exec(dataUrl);
+    if (m) { mime = m[1] || mime; b64 = m[2]; }
+    if (!b64) return { statusCode:200, headers:H, body: JSON.stringify({ ok:false, erro:'arquivo vazio' }) };
+    // base64 -> bytes
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+    const sbHead = k => ({ 'apikey': KEY, 'Authorization': 'Bearer ' + KEY });
+    // Garante o bucket público (ignora erro se já existir).
+    try {
+      await fetch(SB + '/storage/v1/bucket', { method:'POST', headers: Object.assign(sbHead(), { 'Content-Type':'application/json' }), body: JSON.stringify({ id: BUCKET, name: BUCKET, public: true }) });
+    } catch(e) {}
+    const path = new Date().toISOString().slice(0,10) + '/' + Date.now() + '-' + nome;
+    const up = await fetch(SB + '/storage/v1/object/' + BUCKET + '/' + encodeURI(path), {
+      method:'POST',
+      headers: Object.assign(sbHead(), { 'Content-Type': mime, 'x-upsert':'true' }),
+      body: bytes
+    });
+    if (!up.ok) { const t = await up.text(); return { statusCode:200, headers:H, body: JSON.stringify({ ok:false, erro:'upload ' + up.status + ' ' + t }) }; }
+    const publicUrl = SB + '/storage/v1/object/public/' + BUCKET + '/' + encodeURI(path);
+    return { statusCode:200, headers:H, body: JSON.stringify({ ok:true, data:{ configurado:true, url: publicUrl, path } }) };
+  } catch (e) {
+    return { statusCode:200, headers:H, body: JSON.stringify({ ok:false, erro: e.message }) };
+  }
+}
+
+async function hLocalizacoes(event){
+  const H = { 'content-type': 'application/json' };
+  const base = (process.env.SBS_BRASIL_URL || '').replace(/\/+$/, '');
+  const key = process.env.INTEG_KEY || '';
+  if (!base || !key) {
+    return { statusCode: 200, headers: H, body: JSON.stringify({ ok: true, data: { configurado: false, localizacoes: [] } }) };
+  }
+  try {
+    const url = base + '/api/integ/localizacoes?key=' + encodeURIComponent(key);
+    const r = await fetch(url, { headers: { 'accept': 'application/json' } });
+    const txt = await r.text();
+    let data = {};
+    try { data = JSON.parse(txt); } catch (e) { data = {}; }
+    const locs = Array.isArray(data.localizacoes) ? data.localizacoes : [];
+    return { statusCode: 200, headers: H, body: JSON.stringify({ ok: true, data: { configurado: true, localizacoes: locs } }) };
+  } catch (e) {
+    return { statusCode: 200, headers: H, body: JSON.stringify({ ok: true, data: { configurado: true, erro: e.message, localizacoes: [] } }) };
+  }
+}
+
+async function hParceiroIndicadores(event){
+  // Proxy v2 dos indicadores da equipe de campo (SBS Brasil).
+  // Worker: GET <SBS_BRASIL_URL>/api/integ/v1/indicadores  (Authorization: Bearer <INTEG_KEY>)
+  //   + x-integ-key e ?key= como compat v1. Timeout 5s. Erro → DEMONSTRAÇÃO.
+  //   "online/TEMPO REAL" só quando vier atualizadoEm (regra do handoff §5).
+  const H = { 'content-type': 'application/json', 'cache-control': 'no-store' };
+  const base = (process.env.SBS_BRASIL_URL || '').replace(/\/+$/, '');
+  const key = process.env.INTEG_KEY || '';
+  if (!base || !key) {
+    return { statusCode: 200, headers: H, body: JSON.stringify({ ok: true, data: { configurado: false, online: false, indicadores: null } }) };
+  }
+  const num = (d, ...ks) => { for (const k of ks) { if (d[k] != null && !isNaN(Number(d[k]))) return Number(d[k]); } return 0; };
+  const timeout = Number(process.env.INTEG_TIMEOUT_MS || 5000);
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const url = base + '/api/integ/v1/indicadores?key=' + encodeURIComponent(key);
+    const r = await fetch(url, {
+      signal: ctrl.signal,
+      headers: {
+        'authorization': 'Bearer ' + key,   // v2 — chave no header (não vaza em log)
+        'x-integ-key': key,                  // compat v1
+        'accept': 'application/json'
+      }
+    });
+    if (!r.ok) throw new Error('HTTP_' + r.status);
+    const txt = await r.text();
+    let raw = {};
+    try { raw = JSON.parse(txt); } catch (e) { raw = {}; }
+    const d = (raw && (raw.indicadores || raw.data || raw)) || {};
+    const indicadores = {
+      estados: num(d,'estados','estadosAtivos','estados_ativos'),
+      clientes: num(d,'clientes','carteira'),
+      prospects: num(d,'prospects','prospeccao'),
+      rotas: num(d,'rotas','rotasVisitas','rotas_visitas'),
+      agendadas: num(d,'agendadas','visitasAgendadas','visitas_agendadas'),
+      validadas: num(d,'validadas','rotasValidadas','rotas_validadas'),
+      cotacoes: num(d,'cotacoes','cotacoesAbertas'),
+      vendasRS: num(d,'vendasRS','vendas','vendas_rs','faturamento')
+    };
+    const atualizadoEm = raw && raw.atualizadoEm ? String(raw.atualizadoEm) : null;
+    const periodo = raw && raw.periodo ? String(raw.periodo) : null;
+    const versao = raw && raw.versao != null ? raw.versao : null;
+    // TEMPO REAL só quando o worker devolve atualizadoEm (handoff §2/§5).
+    const online = !!atualizadoEm;
+    return { statusCode: 200, headers: H, body: JSON.stringify({ ok: true, data: { configurado: true, online, versao, periodo, atualizadoEm, indicadores } }) };
+  } catch (e) {
+    const motivo = e && e.name === 'AbortError' ? 'TIMEOUT' : (e && e.message) || 'ERRO';
+    return { statusCode: 200, headers: H, body: JSON.stringify({ ok: true, data: { configurado: true, online: false, erro: motivo, indicadores: null } }) };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function pick(m){ return (m && (m.handler || (m.default && m.default.handler))) || null; }
+
+const HANDLERS = {
+  'alertas': pick(fAlertas),
+  'app-login': pick(fAppLogin),
+  'aprovacoes': pick(fAprovacoes),
+  'auditoria': pick(fAuditoria),
+  'auth': pick(fAuth),
+  'biblioteca': pick(fBiblioteca),
+  'campanhas': pick(fCampanhas),
+  'canais': hCanais,
+  'chamados': hChamados,
+  'cashback': hCashback,
+  'clima': pick(fClima),
+  'demandas': pick(fDemandas),
+  'eventos': pick(fEventos),
+  'exportar': hExportar,
+  'integracao': hIntegracao,
+  'lixeira': hLixeira,
+  'ia-groq': pick(fIaGroq),
+  'leads': pick(fLeads),
+  'limpar-teste': pick(fLimparTeste),
+  'localizacoes': hLocalizacoes,
+  'parceiro-indicadores': hParceiroIndicadores,
+  'mercado': pick(fMercado),
+  'monitoramento': pick(fMonitoramento),
+  'notificacoes': pick(fNotificacoes),
+  'orcamentos': pick(fOrcamentos),
+  'parceiros': pick(fParceiros),
+  'produtos': pick(fProdutos),
+  'ranking': pick(fRanking),
+  'resultados': pick(fResultados),
+  'senha': pick(fSenha),
+  'storage': hStorage,
+  'tenants': pick(fTenants),
+  'usuarios': hUsuarios,
+  'vendas': pick(fVendas),
+  'vendedores': pick(fVendedores),
+  'metricas': hMetricas
+};
+
+// Contador de chamadas por rota — diagnóstico de consumo (item 6 do repasse técnico).
+// In-memory por isolate (zera a cada cold start); grava snapshot no Supabase a
+// cada 200 hits acumulados, para sobreviver a reciclagem sem escrever por request.
+const _rotaHits = {};
+let _hitsDesdeFlush = 0;
+async function _contarRota(fn){
+  try {
+    _rotaHits[fn] = (_rotaHits[fn] || 0) + 1;
+    _rotaHits.__total = (_rotaHits.__total || 0) + 1;
+    _hitsDesdeFlush++;
+    if (_hitsDesdeFlush >= 200) {
+      _hitsDesdeFlush = 0;
+      const db = tenantStore('sbs');
+      const prev = (await db.get('metricas', 'rotas')) || { id:'rotas', total:0, rotas:{} };
+      const merged = Object.assign({}, prev.rotas || {});
+      for (const k in _rotaHits){ if(k==='__total') continue; merged[k] = (merged[k]||0) + _rotaHits[k]; }
+      await db.put('metricas', { id:'rotas', total:(prev.total||0)+(_rotaHits.__total||0), rotas:merged, atualizadoEm:new Date().toISOString() });
+      for (const k in _rotaHits) delete _rotaHits[k];
+    }
+  } catch (e) {}
+}
+async function hMetricas(event){
+  const H = { 'content-type':'application/json', 'cache-control':'no-store' };
+  try {
+    const db = tenantStore('sbs');
+    const persist = (await db.get('metricas', 'rotas')) || { total:0, rotas:{} };
+    // Soma o acumulado ainda não gravado deste isolate.
+    const rotas = Object.assign({}, persist.rotas || {});
+    let totalMem = 0;
+    for (const k in _rotaHits){ if(k==='__total'){ totalMem = _rotaHits[k]; continue; } rotas[k]=(rotas[k]||0)+_rotaHits[k]; }
+    const ranking = Object.keys(rotas).map(k=>({ rota:k, hits:rotas[k] })).sort((a,b)=>b.hits-a.hits);
+    return { statusCode:200, headers:H, body: JSON.stringify({ ok:true, data:{ totalPersistido:(persist.total||0)+totalMem, desdeUltimoFlush:_hitsDesdeFlush, ranking, atualizadoEm:persist.atualizadoEm||null } }) };
+  } catch (e) {
+    return { statusCode:200, headers:H, body: JSON.stringify({ ok:false, erro:e.message }) };
+  }
+}
+
+export async function onRequest(context){
+  const { request, env, params } = context;
+
+  // Expõe as variáveis do Pages para o código Node (process.env).
+  try { if (typeof process !== 'undefined' && process.env) { for (const k in env){ if (typeof env[k] === 'string') process.env[k] = env[k]; } } } catch (e) {}
+
+  // Nome da função = primeiro segmento após /api/
+  const segs = (params && params.path) || [];
+  const fn = Array.isArray(segs) ? segs[0] : String(segs || '');
+  const handler = HANDLERS[fn];
+  if (!handler) {
+    return json({ ok: false, erro: 'função não encontrada: ' + fn }, 404);
+  }
+  if (fn !== 'metricas') { try { await _contarRota(fn); } catch (e) {} }
+
+  const url = new URL(request.url);
+  const qs = {};
+  url.searchParams.forEach((v, k) => { qs[k] = v; });
+
+  const headers = {};
+  request.headers.forEach((v, k) => { headers[k] = v; });
+
+  let body = '';
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    try { body = await request.text(); } catch (e) { body = ''; }
+  }
+
+  const event = {
+    httpMethod: request.method,
+    headers,
+    queryStringParameters: qs,
+    body
+  };
+
+  try {
+    const r = await handler(event, {});
+    const h = (r && r.headers) || { 'content-type': 'application/json' };
+    return new Response((r && r.body) || '', { status: (r && r.statusCode) || 200, headers: h });
+  } catch (e) {
+    return json({ ok: false, erro: e.message }, 500);
+  }
+}
+
+function json(obj, status){
+  return new Response(JSON.stringify(obj), { status: status || 200, headers: { 'content-type': 'application/json' } });
+}

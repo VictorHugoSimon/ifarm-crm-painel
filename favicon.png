@@ -1,0 +1,27 @@
+# Variáveis de ambiente — Painel Gerencial Terra Pulse (Cloudflare Pages)
+# Defina em: Pages → Settings → Environment variables (Production e Preview).
+# NÃO comite valores reais. Este arquivo é só um modelo.
+
+# --- Banco (obrigatório) ---
+SUPABASE_URL=            # Project URL do Supabase
+SUPABASE_SERVICE_KEY=    # service_role key (secret) do Supabase
+
+# --- Login (obrigatório) ---
+AUTH_SECRET=             # frase secreta longa e aleatória (assina o token de sessão)
+
+# --- 2FA ---
+# Padrão: ligado (exige app autenticador no 1º login). Para desligar: off
+FORCAR_2FA=off
+
+# --- IA (opcional) ---
+GROQ_API_KEY=            # chave Groq, para os recursos de IA
+
+# --- Integração com o Worker Terra Pulse Brasil (barramento + mapa ao vivo) ---
+SBS_BRASIL_URL=          # URL do worker, ex.: https://terra-pulse-worker.SEU-SUBDOMINIO.workers.dev
+INTEG_KEY=               # MESMA chave secreta definida no worker (mapa/indicadores ao vivo)
+
+# --- E-mail de boas-vindas (opcional, Resend) ---
+RESEND_API_KEY=
+RESEND_FROM=Plataforma Terra Pulse <nao-responda@terrapulse.com.br>
+RESEND_REPLY_TO=suporte@terrapulse.com.br
+APP_URL=                 # URL pública do painel, ex.: https://terra-pulse-painel.pages.dev

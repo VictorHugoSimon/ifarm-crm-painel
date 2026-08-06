@@ -1,0 +1,6 @@
+{
+  "name": "terra-pulse-painel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Painel Gerencial Terra Pulse (Marketing, Gerente Nacional, CEO, Inteligencia, TI) — Cloudflare Pages Functions + Supabase."
+}
