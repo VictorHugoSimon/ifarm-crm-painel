@@ -8,7 +8,7 @@
 
    Envio de e-mail: se RESEND_API_KEY existir, envia o código por e-mail; senão,
    devolve o código na resposta (modo staging) e registra na auditoria. */
-const crypto = require('node:crypto');
+const crypto = process.getBuiltinModule('node:crypto');
 const { get, put, audit, clientIp, ok, fail } = require('./_lib/store');
 const { requireAuth } = require('./_lib/auth');
 
