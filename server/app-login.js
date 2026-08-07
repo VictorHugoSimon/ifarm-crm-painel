@@ -10,7 +10,7 @@
      { acao:'trocar',    senhaAtual, novaSenha }          (Authorization: Bearer)
 
    Sem RESEND_API_KEY o código volta na resposta (staging). Sem bloqueio por tentativas. */
-const crypto = require('crypto');
+const crypto = require('node:crypto');
 const { sign, requireAuth } = require('./_lib/auth');
 const { list, get, put, audit, clientIp, ok, fail } = require('./_lib/store');
 
