@@ -8,7 +8,7 @@
      2) PADRAO      — lista interna Terra Pulse (senha inicial 12345678, precisaTrocar=true)
    Não há bloqueio por tentativas: quem não consegue entrar usa "Esqueci a senha"
    (functions/senha.js). */
-const crypto = require('node:crypto');
+const crypto = process.getBuiltinModule('node:crypto');
 const { sign, verify } = require('./_lib/auth');
 const { list, get, put, audit, clientIp, ok, fail } = require('./_lib/store');
 
