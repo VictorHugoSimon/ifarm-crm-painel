@@ -1,7 +1,7 @@
 /* Autenticação — assinatura/verificação de token stateless (HMAC-SHA256).
    Sem dependências externas: usa o módulo 'crypto' do Node.
    O segredo vem de AUTH_SECRET (variável de ambiente). */
-const crypto = require('crypto');
+const crypto = require('node:crypto');
 function SECRET(){ return process.env.AUTH_SECRET || 'sbs-dev-secret-troque-em-producao'; }
 
 function b64url(buf){ return Buffer.from(buf).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
