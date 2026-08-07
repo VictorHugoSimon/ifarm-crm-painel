@@ -1,0 +1,4 @@
+# Cloudflare Pages — regras de redirecionamento
+# A raiz abre o painel principal do CRM. As Functions (/api/*) e os
+# arquivos .html continuam sendo servidos normalmente (têm prioridade).
+/    /painel-ifarm.html    302
